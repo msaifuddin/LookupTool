@@ -1,6 +1,8 @@
 using System.Text;
 using System.Net.Http.Headers;
 using Newtonsoft.Json.Linq;
+using Azure.Core;
+using Azure.Identity;
 
 namespace searchAll
 {
@@ -13,7 +15,7 @@ namespace searchAll
         private const int _pageSize = 5;
 
         // Cached credential and access token
-        private Azure.Identity.InteractiveBrowserCredential? _interactiveCredential;
+        private InteractiveBrowserCredential? _interactiveCredential;
         private string? _accessToken;
         private DateTime _tokenExpiration;
 
@@ -35,7 +37,7 @@ namespace searchAll
             searchButton.Enabled = false;  // Disable search button initially
             this.Shown += (s, e) => this.ActiveControl = null;
 
-            // Just wire the event here, don't create a new button instance
+            // Wire the cancel button event
             this.cancelButton.Click += new System.EventHandler(this.cancelButton_Click);
         }
 
@@ -58,13 +60,15 @@ namespace searchAll
                 UpdateConnectionStatus($"{_userUPN} is already connected.", Color.Green, FontStyle.Bold);
                 connectButton.Enabled = false; // Disable the button if already connected
                 searchButton.Enabled = true;   // Enable the search button after connection
-                cancelButton.Enabled = false;  // Disable the cancel button after successful authentication
+                cancelButton.Text = "Logout";
+                cancelButton.Enabled = true;  // Enable the cancel button after successful authentication
                 return;
             }
 
             _isCancelRequested = false; // Reset the cancel flag
             countdownTime = 60; // Reset countdown
 
+            cancelButton.Text = "Cancel"; // Ensure cancel button shows "Cancel"
             cancelButton.Enabled = true;  // Enable the cancel button
             connectButton.Enabled = false; // Disable the connect button to prevent multiple clicks
             searchButton.Enabled = false;  // Disable the search button until connected
@@ -78,7 +82,7 @@ namespace searchAll
 
                 if (_interactiveCredential == null)
                 {
-                    _interactiveCredential = new Azure.Identity.InteractiveBrowserCredential(new Azure.Identity.InteractiveBrowserCredentialOptions
+                    _interactiveCredential = new InteractiveBrowserCredential(new InteractiveBrowserCredentialOptions
                     {
                         ClientId = _clientId
                     });
@@ -87,35 +91,32 @@ namespace searchAll
                 // Countdown task
                 var countdownTask = Task.Run(async () =>
                 {
-                    while (countdownTime > 0 && !_isConnected) // Continue only if not connected
+                    while (countdownTime > 0 && !_isConnected && !_isCancelRequested) // Check for cancellation
                     {
-                        if (_isCancelRequested) // Check if cancel is requested
-                        {
-                            break; // Exit the loop immediately if cancelled
-                        }
-
                         await Task.Delay(1000); // Wait for 1 second
                         countdownTime--;
 
                         this.Invoke((Action)(() =>
                         {
-                            if (!_isConnected) // Continue updating only if not connected
+                            if (!_isConnected && !_isCancelRequested) // Update only if not connected or cancelled
                             {
                                 UpdateConnectionStatus($"Authenticating... ({countdownTime}s)", Color.Orange, FontStyle.Bold);
                             }
                         }));
                     }
 
-                    // Only trigger timeout if not connected
-                    if (!_isConnected && countdownTime == 0)
+                    // Only trigger timeout if not connected and not cancelled
+                    if (!_isConnected && countdownTime == 0 && !_isCancelRequested)
                     {
                         this.Invoke((Action)(() =>
                         {
                             UpdateConnectionStatus("Authentication timed out.", Color.Red, FontStyle.Bold);
                             connectButton.Enabled = true;  // Allow retry after cancel or timeout
                             cancelButton.Enabled = false;  // Disable the cancel button
+                            cancelButton.Text = "Cancel";  // Reset button text
                             searchButton.Enabled = false;  // Keep the search button disabled if not connected
                         }));
+                        _cancellationTokenSource?.Cancel(); // Cancel the token source on timeout
                     }
                 });
 
@@ -129,10 +130,10 @@ namespace searchAll
                             throw new OperationCanceledException("Authentication cancelled.");
                         }
 
-                        await GetAccessTokenAsync(CancellationToken.None); // Skip using tokens for now
+                        await GetAccessTokenAsync(_cancellationTokenSource.Token); // Use the cancellation token
 
-                        // Fetch the UPN (connected user's display name)
-                        await FetchUserUPNAsync();
+                        // Fetch the UPN (connected user's given name)
+                        await FetchUserUPNAsync(_cancellationTokenSource.Token);
 
                         if (_isCancelRequested) // Check again after fetching UPN
                         {
@@ -147,16 +148,18 @@ namespace searchAll
                             UpdateConnectionStatus($"{_userUPN} is connected.", Color.Green, FontStyle.Bold);
                             connectButton.Enabled = false; // Disable the connect button after successful authentication
                             searchButton.Enabled = true;   // Enable search button after successful authentication
-                            cancelButton.Enabled = false;  // Disable the cancel button after successful authentication
+                            cancelButton.Text = "Logout";
+                            cancelButton.Enabled = true;  // Enable the cancel button after successful authentication
                         }));
                     }
                     catch (OperationCanceledException)
                     {
                         this.Invoke((Action)(() =>
                         {
-                            UpdateConnectionStatus("Authentication cancelled by user.", Color.Red, FontStyle.Bold);
+                            UpdateConnectionStatus("Login cancelled.", Color.Red, FontStyle.Bold);
                             connectButton.Enabled = true;  // Re-enable connect button
                             cancelButton.Enabled = false;  // Disable cancel button
+                            cancelButton.Text = "Cancel";  // Reset button text
                             searchButton.Enabled = false;  // Keep search button disabled
                         }));
                     }
@@ -167,6 +170,7 @@ namespace searchAll
                             UpdateConnectionStatus($"Error: {ex.Message}", Color.Red, FontStyle.Bold);
                             connectButton.Enabled = true;  // Re-enable connect button after failure
                             cancelButton.Enabled = false;  // Disable cancel button after failure
+                            cancelButton.Text = "Cancel";  // Reset button text
                             searchButton.Enabled = false;  // Keep search button disabled
                         }));
                     }
@@ -187,21 +191,44 @@ namespace searchAll
         // Cancel button event handler
         private void cancelButton_Click(object? sender, EventArgs e)
         {
-            try
+            if (cancelButton.Text == "Cancel")
             {
-                // Start a new instance of the application
-                System.Diagnostics.Process.Start(Application.ExecutablePath); // Relaunch the application
+                _isCancelRequested = true;
+                _cancellationTokenSource?.Cancel();
 
-                // Forcefully exit the current instance
-                System.Diagnostics.Process.GetCurrentProcess().Kill(); // This forcefully kills the current process
+                // Update the status label immediately
+                UpdateConnectionStatus("Login cancelled.", Color.Red, FontStyle.Bold);
+
+                // Disable buttons appropriately
+                connectButton.Enabled = true;  // Re-enable connect button
+                cancelButton.Enabled = false;  // Disable cancel button
+                searchButton.Enabled = false;  // Keep search button disabled
             }
-            catch (Exception ex)
+            else if (cancelButton.Text == "Logout")
             {
-                MessageBox.Show($"Failed to restart the application. Error: {ex.Message}");
+                // Handle logout
+                _isConnected = false;
+                _accessToken = null;
+                _tokenExpiration = DateTime.MinValue;
+                _interactiveCredential = null; // Optionally reset the credential
+
+                UpdateConnectionStatus("Logged out.", Color.Red, FontStyle.Bold);
+
+                connectButton.Enabled = true;  // Re-enable connect button
+                cancelButton.Enabled = false;  // Disable cancel button
+                cancelButton.Text = "Cancel";  // Reset button text
+                searchButton.Enabled = false;  // Disable search button
+
+                // Clear any UI elements that need to be cleared
+                ClearResults();
+                totalResultsLabel.Text = "";
+                paginationInfoLabel.Text = "";
+                userDetailsTextBox.Visible = false;
+                _userUPN = null;
             }
         }
 
-        // Adjust GetAccessTokenAsync to take CancellationToken
+        // Adjust GetAccessTokenAsync to take CancellationToken and implement token caching
         private async Task<string> GetAccessTokenAsync(CancellationToken cancellationToken)
         {
             if (_interactiveCredential == null)
@@ -209,25 +236,34 @@ namespace searchAll
                 throw new InvalidOperationException("Interactive credential is not initialized.");
             }
 
-            var tokenRequestContext = new Azure.Core.TokenRequestContext(new[] { "https://graph.microsoft.com/.default" });
-            var tokenResponse = await _interactiveCredential.GetTokenAsync(tokenRequestContext, cancellationToken); // Use cancellationToken here
-            return tokenResponse.Token;
+            if (_accessToken != null && DateTime.UtcNow < _tokenExpiration)
+            {
+                return _accessToken;
+            }
+
+            var tokenRequestContext = new TokenRequestContext(new[] { "https://graph.microsoft.com/.default" });
+            var tokenResponse = await _interactiveCredential.GetTokenAsync(tokenRequestContext, cancellationToken);
+
+            _accessToken = tokenResponse.Token;
+            _tokenExpiration = tokenResponse.ExpiresOn.UtcDateTime; // Use ExpiresOn
+
+            return _accessToken;
         }
 
         // Fetch UPN after authentication
-        private async Task FetchUserUPNAsync()
+        private async Task FetchUserUPNAsync(CancellationToken cancellationToken)
         {
-            var token = await GetAccessTokenAsync(CancellationToken.None); // Pass CancellationToken.None here
+            var token = await GetAccessTokenAsync(cancellationToken);
             using (HttpClient httpClient = new HttpClient())
             {
                 httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                var response = await httpClient.GetAsync("https://graph.microsoft.com/v1.0/me");
+                var response = await httpClient.GetAsync("https://graph.microsoft.com/v1.0/me", cancellationToken);
 
                 if (response.IsSuccessStatusCode)
                 {
                     var jsonResponse = await response.Content.ReadAsStringAsync();
                     var user = JObject.Parse(jsonResponse);
-                    _userUPN = user["givenName"]?.ToString();
+                    _userUPN = user["givenName"]?.ToString(); // Use givenName
                 }
             }
         }
@@ -305,11 +341,17 @@ namespace searchAll
             {
                 UpdateSearchStatus("Searching for user...", true);
 
-                var token = await GetAccessTokenAsync(CancellationToken.None); // Use CancellationToken.None here
+                var token = await GetAccessTokenAsync(CancellationToken.None);
                 using (HttpClient httpClient = new HttpClient())
                 {
                     httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                    var response = await httpClient.GetAsync($"https://graph.microsoft.com/v1.0/users?$filter=startswith(userPrincipalName,'{searchText}') or startswith(displayName,'{searchText}') or startswith(givenName,'{searchText}') or startswith(surname,'{searchText}')");
+
+                    // Escape searchText to prevent OData errors
+                    string escapedSearchText = Uri.EscapeDataString(searchText.Replace("'", "''"));
+
+                    var query = $"https://graph.microsoft.com/v1.0/users?$filter=startswith(userPrincipalName,'{escapedSearchText}') or startswith(displayName,'{escapedSearchText}') or startswith(givenName,'{escapedSearchText}') or startswith(surname,'{escapedSearchText}')";
+
+                    var response = await httpClient.GetAsync(query);
 
                     if (response.IsSuccessStatusCode)
                     {
@@ -350,48 +392,56 @@ namespace searchAll
             {
                 UpdateSearchStatus($"Searching for device: {searchText}...", true);
 
-                var token = await GetAccessTokenAsync(CancellationToken.None); // Pass CancellationToken.None here
+                var token = await GetAccessTokenAsync(CancellationToken.None);
                 using (HttpClient httpClient = new HttpClient())
                 {
                     httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
 
-                    var response = await httpClient.GetAsync($"https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$filter=serialNumber eq '{searchText}'");
+                    // Escape searchText to prevent OData errors
+                    string escapedSearchText = searchText.Replace("'", "''");
 
-                    if (!response.IsSuccessStatusCode)
+                    // Search by serial number
+                    var query = $"https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$filter=serialNumber eq '{escapedSearchText}'";
+                    var response = await httpClient.GetAsync(query);
+
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var jsonResponse = await response.Content.ReadAsStringAsync();
+                        var devices = JObject.Parse(jsonResponse)["value"];
+
+                        if (devices != null && devices.Any())
+                        {
+                            _deviceSearchResults = devices.Select(d => d?.ToObject<JObject>()).ToList();
+                            return; // Devices found by serial number
+                        }
+                    }
+                    else
                     {
                         UpdateSearchStatus($"Error searching device by serial number: {response.ReasonPhrase}", true);
                         return;
                     }
 
-                    var jsonResponse = await response.Content.ReadAsStringAsync();
-                    var devices = JObject.Parse(jsonResponse)["value"];
+                    // If no devices found by serial number, search by device name
+                    query = $"https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$filter=deviceName eq '{escapedSearchText}'";
+                    response = await httpClient.GetAsync(query);
 
-                    if (devices != null && devices.Any())
+                    if (response.IsSuccessStatusCode)
                     {
-                        _deviceSearchResults = devices.Select(d => d?.ToObject<JObject>()).ToList();
-                    }
-                    else
-                    {
-                        response = await httpClient.GetAsync($"https://graph.microsoft.com/v1.0/deviceManagement/managedDevices?$filter=deviceName eq '{searchText}'");
+                        var jsonResponse = await response.Content.ReadAsStringAsync();
+                        var devices = JObject.Parse(jsonResponse)["value"];
 
-                        if (response.IsSuccessStatusCode)
+                        if (devices != null && devices.Any())
                         {
-                            jsonResponse = await response.Content.ReadAsStringAsync();
-                            devices = JObject.Parse(jsonResponse)["value"];
-
-                            if (devices != null && devices.Any())
-                            {
-                                _deviceSearchResults = devices.Select(d => d?.ToObject<JObject>()).ToList();
-                            }
-                            else
-                            {
-                                UpdateSearchStatus($"No device found with serial number or device name: {searchText}", true);
-                            }
+                            _deviceSearchResults = devices.Select(d => d?.ToObject<JObject>()).ToList();
                         }
                         else
                         {
-                            UpdateSearchStatus($"Error searching device by device name: {response.ReasonPhrase}", true);
+                            UpdateSearchStatus($"No device found with serial number or device name: {searchText}", true);
                         }
+                    }
+                    else
+                    {
+                        UpdateSearchStatus($"Error searching device by device name: {response.ReasonPhrase}", true);
                     }
                 }
             }
@@ -411,6 +461,13 @@ namespace searchAll
             userListBox.Items.Clear();
 
             int totalResults = _userSearchResults.Count + _deviceSearchResults.Count;
+
+            if (totalResults == 0)
+            {
+                UpdatePaginationButtons(0, 0);
+                return;
+            }
+
             int totalPages = (int)Math.Ceiling((double)totalResults / _pageSize);
 
             if (_currentPage > totalPages) _currentPage = totalPages;
@@ -419,13 +476,16 @@ namespace searchAll
 
             foreach (var (result, index) in pagedResults.Select((result, i) => (result, i)))
             {
-                if (result.ContainsKey("deviceName"))
+                if (result != null)
                 {
-                    userListBox.Items.Add($"{((_currentPage - 1) * _pageSize) + index + 1}. Device: {result["deviceName"]} (Serial: {result["serialNumber"]})");
-                }
-                else if (result.ContainsKey("displayName"))
-                {
-                    userListBox.Items.Add($"{((_currentPage - 1) * _pageSize) + index + 1}. User: {result["displayName"]} ({result["userPrincipalName"]})");
+                    if (result.ContainsKey("deviceName"))
+                    {
+                        userListBox.Items.Add($"{((_currentPage - 1) * _pageSize) + index + 1}. Device: {result["deviceName"]} (Serial: {result["serialNumber"]})");
+                    }
+                    else if (result.ContainsKey("displayName"))
+                    {
+                        userListBox.Items.Add($"{((_currentPage - 1) * _pageSize) + index + 1}. User: {result["displayName"]} ({result["userPrincipalName"]})");
+                    }
                 }
             }
 
@@ -449,19 +509,19 @@ namespace searchAll
                 {
                     if (selectedResult.ContainsKey("displayName"))
                     {
-                        await DisplayUserDetailsAsync(selectedResult);
+                        DisplayUserDetails(selectedResult);
                         await FetchAndDisplayUserDevicesAsync(selectedResult);
                     }
                     else if (selectedResult.ContainsKey("deviceName"))
                     {
-                        await DisplayDeviceDetailsAsync(selectedResult);
+                        DisplayDeviceDetails(selectedResult);
                         await DisplayAssociatedUserAsync(selectedResult);
                     }
                 }
             }
         }
 
-        private async Task DisplayUserDetailsAsync(JObject user)
+        private void DisplayUserDetails(JObject user)
         {
             StringBuilder sb = new StringBuilder();
             sb.AppendLine($"DisplayName: {user["displayName"]}");
@@ -479,7 +539,7 @@ namespace searchAll
             userDetailsTextBox.Text = sb.ToString();
         }
 
-        private async Task DisplayDeviceDetailsAsync(JObject device)
+        private void DisplayDeviceDetails(JObject device)
         {
             StringBuilder sb = new StringBuilder();
             sb.AppendLine($"Device Name: {device["deviceName"]}");
@@ -496,23 +556,32 @@ namespace searchAll
             StringBuilder sb = new StringBuilder();
             sb.AppendLine("\n\nAssociated User:");
 
-            var token = await GetAccessTokenAsync(CancellationToken.None); // Use CancellationToken.None here
+            var token = await GetAccessTokenAsync(CancellationToken.None);
             using (HttpClient httpClient = new HttpClient())
             {
                 httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                var response = await httpClient.GetAsync($"https://graph.microsoft.com/v1.0/users/{device["userId"]}");
+                var userId = device["userId"]?.ToString();
 
-                if (response.IsSuccessStatusCode)
+                if (!string.IsNullOrEmpty(userId))
                 {
-                    var jsonResponse = await response.Content.ReadAsStringAsync();
-                    var user = JObject.Parse(jsonResponse);
+                    var response = await httpClient.GetAsync($"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(userId)}");
 
-                    sb.AppendLine($"UserPrincipalName: {user["userPrincipalName"]}");
-                    sb.AppendLine($"DisplayName: {user["displayName"]}");
+                    if (response.IsSuccessStatusCode)
+                    {
+                        var jsonResponse = await response.Content.ReadAsStringAsync();
+                        var user = JObject.Parse(jsonResponse);
+
+                        sb.AppendLine($"UserPrincipalName: {user["userPrincipalName"]}");
+                        sb.AppendLine($"DisplayName: {user["displayName"]}");
+                    }
+                    else
+                    {
+                        sb.AppendLine("Associated user not found.");
+                    }
                 }
                 else
                 {
-                    sb.AppendLine("Associated user not found.");
+                    sb.AppendLine("No associated user ID.");
                 }
             }
 
@@ -524,40 +593,50 @@ namespace searchAll
             StringBuilder sb = new StringBuilder();
             sb.AppendLine("\n\nRegistered Devices:");
 
-            var token = await GetAccessTokenAsync(CancellationToken.None); // Pass CancellationToken.None here
+            var token = await GetAccessTokenAsync(CancellationToken.None);
             using (HttpClient httpClient = new HttpClient())
             {
                 httpClient.DefaultRequestHeaders.Authorization = new AuthenticationHeaderValue("Bearer", token);
-                var response = await httpClient.GetAsync($"https://graph.microsoft.com/v1.0/users/{user["id"]}/managedDevices");
+                var userId = user["id"]?.ToString();
 
-                if (response.IsSuccessStatusCode)
+                if (!string.IsNullOrEmpty(userId))
                 {
-                    var jsonResponse = await response.Content.ReadAsStringAsync();
-                    var devices = JObject.Parse(jsonResponse)["value"];
+                    var response = await httpClient.GetAsync($"https://graph.microsoft.com/v1.0/users/{Uri.EscapeDataString(userId)}/managedDevices");
 
-                    if (devices != null && devices.Any())
+                    if (response.IsSuccessStatusCode)
                     {
-                        foreach (var device in devices)
+                        var jsonResponse = await response.Content.ReadAsStringAsync();
+                        var devices = JObject.Parse(jsonResponse)["value"];
+
+                        if (devices != null && devices.Any())
                         {
-                            sb.AppendLine($"Device Name: {device["deviceName"]?.ToString() ?? "N/A"}");
-                            sb.AppendLine($"Model: {device["model"]?.ToString() ?? "N/A"}");
-                            sb.AppendLine($"Serial Number: {device["serialNumber"]?.ToString() ?? "N/A"}");
-                            sb.AppendLine("------------");
+                            foreach (var device in devices)
+                            {
+                                sb.AppendLine($"Device Name: {device["deviceName"]?.ToString() ?? "N/A"}");
+                                sb.AppendLine($"Model: {device["model"]?.ToString() ?? "N/A"}");
+                                sb.AppendLine($"Serial Number: {device["serialNumber"]?.ToString() ?? "N/A"}");
+                                sb.AppendLine("------------");
+                            }
+                        }
+                        else
+                        {
+                            sb.AppendLine("No devices found.");
                         }
                     }
                     else
                     {
-                        sb.AppendLine("No devices found.");
+                        sb.AppendLine($"Error fetching devices: {response.ReasonPhrase}");
                     }
                 }
                 else
                 {
-                    sb.AppendLine($"Error fetching devices: {response.ReasonPhrase}");
+                    sb.AppendLine("User ID is not available.");
                 }
             }
 
             userDetailsTextBox.AppendText(sb.ToString());
         }
+
         private void nextPageButton_Click(object sender, EventArgs e)
         {
             if (_currentPage * _pageSize < _userSearchResults.Count + _deviceSearchResults.Count)
@@ -575,18 +654,20 @@ namespace searchAll
                 DisplaySearchResults();
             }
         }
+
         private void UpdatePaginationButtons(int totalResults, int totalPages)
         {
-            previousPageButton.Enabled = _currentPage > 1;
-            nextPageButton.Enabled = _currentPage < totalPages;
-
-            paginationInfoLabel.Text = $"Page {_currentPage} of {totalPages}";
-
             if (totalResults == 0)
             {
                 previousPageButton.Enabled = false;
                 nextPageButton.Enabled = false;
                 paginationInfoLabel.Text = "No results found";
+            }
+            else
+            {
+                previousPageButton.Enabled = _currentPage > 1;
+                nextPageButton.Enabled = _currentPage < totalPages;
+                paginationInfoLabel.Text = $"Page {_currentPage} of {totalPages}";
             }
         }
 
